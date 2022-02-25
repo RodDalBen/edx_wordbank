@@ -1,0 +1,511 @@
+---
+title: "PH125.9x Data Science: WordBank project"
+author: "Rodrigo Dal Ben de Souza"
+date: "24/02/2022"
+output:
+  pdf_document: 
+    number_sections: yes
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+bibliography: references.bib
+---
+
+\pagebreak
+
+# Introduction
+
+Mastering a language is an daunting task--as any second language learner will quick attest. However infants seem to tackle this problem seamlessly and with great success. They begin their lives with very little linguistic knowledge and by their second anniversary they have already mastered a great deal of their native(s) language(s) (@Werker2005). Vocabulary growth is an important source of information about processes and mechanisms of language development. For instance, using validated instruments such as The MacArthur-Bates Communicative Development Inventories (hereafter referred as CDI; @fenson2007), researchers have discovered a great deal about comprehension and production of language, grammatical and lexical repertoires, and lexical networks (for a review see @frank2021). The CDI is a set of inventories that assess vocabulary growth based on parent-report on what their children can understand (receptive vocabulary) and speak (productive vocabulary).
+
+Recently, a joint effort between researchers from across the globe lead to the creation of the [WordBank](http://wordbank.stanford.edu/): an evolving repository of CDI data from more than 20 languages and 40,000 children (@Frank2017). The repository is designed to facilitate reuse and reanalyses of CDI data, allowing anyone interested in language development to explore these rich vocabulary growth data (@frank2021). All data and several analyses are openly available at the [WordBank website](http://wordbank.stanford.edu/) and as a R package: `wordbankr`.
+
+In the present project, we will use machine learning algorithms to generate insights about relationships between demographic/linguistic variables (our predictors) and vocabulary growth, as measured by **productive vocabulary** on the CDI (our outcome measure). All our analyses are exploratory in nature and we don't have any hypotheses or predictions on what we might find. We will start with curating our dataset, moving to descriptive analyses and visualizations, and finally to three machine learning algorithms to the data: regression trees, random forests, and linear regression.
+
+# Method
+
+## Libraries
+
+We will use seven packages on this project: 1) `wordbankr` is used to access the data, 2) `tidyverse` is used for data manipulation and visualizations, 3) `here` for a quick way to use relative paths, 4) `caret` is used for creating training and test sets and to assess variable importance in random forests, 5) `rpart` is used to run regression trees, 6) `rpart.plot` for plotting regression trees, and 7) `randomForest` is used to fit random forests. We will also color-blind friendly palette (`cb_pal`) for exploratory plots.
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+# general info from sessionInfo()
+# R version 4.1.2
+# Platform: aarch64-apple-darwin20 (64-bit)
+# Running under: macOS Monterey 12.1
+
+# install packages if necessary -- code based on: 
+# https://statsandr.com/blog/an-efficient-way-to-install-and-load-r-packages/
+
+# packages w/ version
+pkgs <- c("wordbankr", # v0.3.1
+          "tidyverse", # v1.3.1
+          "here", # v1.0.1
+          "caret", # v6.0-90
+          "rpart", # v4.1-15
+          "rpart.plot", # v3.1.0 
+          "randomForest" # v4.6-14
+          ) 
+
+# if necessary install
+installed_pkgs <- pkgs %in% rownames(installed.packages())
+if(any(installed_pkgs == F)){install.packages(pkgs[!installed_packages])}
+
+# load packages
+invisible(lapply(pkgs, library, character.only = T))
+
+# clean
+rm(installed_pkgs, pkgs)
+
+# color-blind friendly palette
+color_blind_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+## Data
+
+There are several datasets available on WordBank, for more a complete description on available datasets see @frank2021. Here we will use the **administration** dataset, which contains several demographic and linguistic information (e.g., age in months, sex, caregivers' level of educational, language), as well as vocabulary data (comprehension and production).
+
+```{r, results='hide'}
+# load raw data
+data_raw <- wordbankr::get_administration_data()
+```
+
+The raw administration dataset contains `r nrow(data_raw)` observations of `r ncol(data_raw)` variables: `r names(data_raw)`. Given our goal of exploring relationships between demographic and lingusitic variables with vocabulary growth, we will clean variables that are not relevant to our analyses.
+
+```{r, results='hide'}
+# data overview
+head(data_raw)
+
+# drop variables
+data_clean01 <- data_raw %>% 
+  select(-data_id, -zygosity, -norming, -longitudinal, -source_name, -license)
+
+# convert character to factor
+str(data_clean01)
+
+data_clean01 <- data_clean01 %>% 
+  mutate(language = as_factor(language),
+         form = as_factor(form))
+
+str(data_clean01)
+```
+
+Having comparable data across languages is essential for meaningful analyses. It is worth remembering that the CDI is composed of a family of measuring instruments. For instance, the data in our dataset comes from `r n_distinct(data_clean01$form)` different forms. Now we will check the distribution of data from these forms across the `r n_distinct(data_clean01$language)` languages.
+
+```{r}
+# calculate frequency of languages for each form
+freq_form <- data_clean01 %>% 
+  group_by(form) %>% 
+  summarise(n_language = n_distinct(language), 
+            n_obs = n()) %>% 
+  arrange(desc(n_obs))
+
+freq_form
+```
+
+Most of our data (`r sum(freq_form[1,3], freq_form[2,3])` observations) comes from the **Words and Sentences** and **Words and Gestures** forms, which were administered across several languages (`r freq_form[1, 2]`, `r freq_form[2, 2]`, respectively). In contrast, **TEDS Twos** and **TEDS Threes** were also administered thousands of times (`r sum(freq_form[3,3], freq_form[4,3])` observations), but only in one language--as the remaining forms. Thus, we will focus on data from the **Words and Sentences** and **Words and Gestures** forms for our analyses.
+
+```{r}
+# filter forms
+data_clean02 <- data_clean01 %>% 
+  filter(form %in% c("WS", "WG")) %>% 
+  droplevels()
+```
+
+Our filtered dataset has `r nrow(data_clean02)` observations from `r n_distinct(data_clean02$language)` languages. Now let's glance our dataset, especially looking for missing values. 
+
+```{r}
+# check NAs
+summary(data_clean02)
+```
+
+We can quickly see several missing values in birth order, ethnicity, caregivers' education, and sex. Let's calculate the proportion of missing values for each of these predictors.
+
+```{r warning=FALSE}
+# proportion of NA in: birth order, ethnicity, caregivers' education, sex
+na_prop <- data_clean02 %>% 
+  select(birth_order, ethnicity, mom_ed, sex) %>% 
+  gather(key = predictor) %>%
+  group_by(predictor) %>% 
+  summarise(prop_missing = round(sum(is.na(value))/n(),2))
+
+# create table with proportion of missing data
+na_prop %>% knitr::kable()
+```
+
+Birth order, ethnicity, and caregivers' educational level have a substantive number of missing cases. Any manipulation on these variables have the potential to bias our analyses For instance, if we delete ethnicity missing cases we will loose more than 90% of our data, whereas if we replace missing values with most common values we may end with a very biased estimates for birth order and caregivers' educational level. Thus, we will drop these variables from our dataset. 
+
+```{r}
+# drop birth order, ethnicity, caregivers' education
+data_clean03 <- data_clean02 %>% 
+  select(-birth_order, -ethnicity, -mom_ed) 
+
+# glance dataset
+summary(data_clean03)
+```
+
+We still have to deal with missing values from the `sex` variable, which counts for roughly 3% of the cases. Luckily, previous research have consistently shown that females have larger productive vocabularies than males and that this is true across languages (e.g., @Frank2017). So we will calculate the median productive vocabulary for males and females on each form (WS, WG) and use it to classify missing values.
+
+```{r, warning=FALSE, message=FALSE}
+# calculate median vocabulary scores 
+data_clean03 %>% 
+  group_by(sex, form) %>% 
+  summarise(m_prod = median(production))
+
+# classify missing values
+data_clean04 <- data_clean03 %>% 
+  mutate(sex = case_when((is.na(sex) & form == "WG" & production >= 8) ~ "Female",
+                         (is.na(sex) & form == "WG" & production <= 8) ~ "Male",
+                         (is.na(sex) & form == "WS" & production >= 318) ~ "Female",
+                         (is.na(sex) & form == "WS" & production <= 318) ~ "Male",
+                         T ~ as.character(sex)),
+         sex = as_factor(sex))
+
+# glance at data and calculate differences
+summary(data_clean04)
+```
+
+Using this classification strategy, `r 28381 - 27866` NAs were classified as females and `r 29604 - 28339` as males. Our final dataset contains `r nrow(data_clean04)` observations and `r ncol(data_clean04)` variables, namely: `r names(data_clean04)`.
+
+Now we will split our data it into training and test sets. The training set will be used to train our models and the test set to evaluate our models' accuracy. Given the relatively small size of our final dataset (`r nrow(data_clean04)` observations), we will try to balance the amount of variance in parameter estimation during training with the amount of variance in our performance statistic during test. Thus, we will use a split of 70/30, which is [slightly more conservative](https://www.researchgate.net/post/Is-there-an-ideal-ratio-between-a-training-set-and-validation-set-Which-trade-off-would-you-suggest) than other proportions, such as the commonly used [Pareto proportion (80/20)](https://en.wikipedia.org/wiki/Pareto_principle).
+
+```{r, warning=FALSE}
+# set seed for reproducibility
+if_else(getRversion() < 3.5, set.seed(123), set.seed(123, sample.kind = "Rounding"))
+
+# set outcome
+y <- data_clean04$production
+  
+# partioning data
+# create index: 70% (training) 30% (test)
+data_index <- createDataPartition(y, p = 0.7, times = 1, list = F)
+
+# create train and test data
+data_train <- data_clean04 %>% slice(data_index)
+data_test <- data_clean04 %>% slice(-data_index)
+
+# double check proportions
+round(nrow(data_train)/(nrow(data_clean04)), 2)
+round(nrow(data_test)/(nrow(data_clean04)), 2)
+```
+
+## Descriptives and Visualizations
+
+Now we will explore patterns in our data using both descriptive statistics and visualizations. Importantly, we will explore our training set while saving our test set for model evaluation only. We will begin with a brief summary of our data.
+
+```{r}
+# summary statistics (training set)
+summary(data_train)
+```
+
+From this summary, we learn that age vary from 7 to 36 months, with a mean of 21.29 months. We also learn that overall comprehension scores are higher (*Med* = 188) than production scores (*Med* = 120), which is in line with normal vocabulary growth trajectories. Also, data is roughly balanced between male (n = 20737) and females (n = 19854). Now we will plot the distribution of our outcome: productive vocabulary. 
+
+```{r}
+# distribution of outcome
+data_train %>% 
+  ggplot(aes(x = production)) + 
+  geom_histogram(binwidth = 10, 
+                 fill = color_blind_colors[3], 
+                 color = "black",
+                 alpha = 0.8) +
+  labs(title = "Distribution of produced words",
+       x = "Number of produced words", 
+       y = "Frequency") +
+  theme_bw()
+```
+
+This plot clearly shows that our outcome is positively skewed, drawing a Zipf curve, with most children producing no words and fewer children producing most words. Now we will explore trends in productive vocabulary across age and gender.
+
+```{r}
+# productive vocab by age, gender, and instrument (form)
+data_train %>% 
+  ggplot(aes(x = age, y = production, color = sex)) + 
+  stat_summary(fun = mean) +
+  stat_summary(fun = mean, geom = "line") +
+  facet_wrap(~ form) +
+  scale_color_manual(values= color_blind_colors) +
+  xlim(5, 40) +
+  labs(title = "Word production by age, gender, and instrument",
+       x = "Age (months)", 
+       y = "Number of produced words",
+       color = "Gender") +
+  theme_bw()
+```
+
+The plots above show that productive vocabulary increases with age for both genders and instruments (forms). In addition, consistent with previous research, overall, females have larger vocabularies than males across both age and instruments (@Frank2017). Now we analyse whether the positive trend between age and productive vocabulary is also observed across languages.
+
+```{r warning=FALSE, message=FALSE}
+# productive vocab by age and language
+data_train %>% 
+  ggplot(aes(x = age, y = production)) + 
+  stat_summary(fun = mean, geom = "line") +
+  facet_wrap(~ language) +
+  xlim(5, 40) +
+  labs(title = "Word production by age and language",
+       x = "Age (months)", 
+       y = "Number of produced words") +
+  theme_bw() +
+  theme(strip.text = element_text(size = 6))
+```
+
+Indeed, productive vocabulary increases with age across all languages, which suggests that the machine learning analyses we will develop in this project might generalize across languages. Now we will explore trends between receptive vocabulary and productive vocabulary.
+
+```{r warning=FALSE}
+# productive vocab by comprehension and instrument (form)
+data_train %>% 
+  ggplot(aes(x = comprehension, y = production)) + 
+  geom_smooth(se = F, color = color_blind_colors[3]) +
+  facet_wrap(~ form) +
+  labs(title = "Word production by comprehension and instrument",
+       x = "Average number of comprehended words", 
+       y = "Average number of produced words") +
+  theme_bw()
+```
+
+The plots above show that there is a positive trend between receptive and productive vocabulary sizes. The negatively skewed trend for Words and Gestures scores (plot on the left) is in line with the "bootstrap effect" on language development, where initial words are learned slowly and are followed by a "boom" on word production (e.g., @Kachergis2017a, @Werker2013). On the other hand, we see an almost linear trend for scores on the Words and Sentences form, which is not surprising as it measures word learning for older infants that have already mastered a great deal of their language(s). 
+
+Building on these exploratory trends, we will now try to model the relationships between our predictors (i.e., age, form, language, sex, comprehension) and our outcome (i.e., productive vocabulary) using three machine learning approaches: regression trees, random forests, and linear regression.
+
+## Models
+
+*Regression Trees* operate by predicting a continuous outcome variable $Y$ by partitioning the predictors based on their relationships with the outcome. These partioning create a decision tree (that can be visualized as a flowchart) with predictions at the end of the tree (i.e., *nodes*). Mathematically, our model will partition predictors based on its' non-overlapping regions and on the amount of error reduction. We will calculate the RMSE between predicted and observed scores as a measure of model accuracy.
+
+*Random Forests* are a common method to remedy some of the shortcoming from regression trees. On one side, it potentially improves prediction and reduces variability by averaging many regression trees that are randomly built using boostraping. On the other side, interpreting random forests is more challenging than interpreting regression trees. We will use the `randomForest` package to fit our model and we will assess the predictors' importance using the `caret` package. Again, we will calculate the RMSE between predicted and observed scores as a measure of model accuracy.
+
+*Linear Regression* models linear relationships between the outcome and predictors and, assuming a fairly linear trend, allow us to predict the outcome score given some predictors scores. This is arguably the simplest model from the three, but can be quite powerfull. It can also serve as a comparison point for the other two models. We will use the `lm()` function to fit our model and *RMSE* scores to evaluate its accuracy.
+
+# Results
+
+## Regression Tree
+
+Here we fit a regression tree to explore relationships between our predictors (i.e., age, sex, language, comprehension, form) and our outcome (i.e., productive vocabulary).
+
+```{r, warning=FALSE, message=FALSE}
+# set seed for reproducibility
+if_else(getRversion() < 3.5, set.seed(234), set.seed(234, sample.kind = "Rounding"))
+
+# fit regression tree to training set
+rpart_fit <- rpart(production ~ ., data = data_train, method = "anova")
+
+# plot regression tree
+rpart.plot(rpart_fit, digits = 3, fallen.leaves = T)
+```
+
+Our regression tree resulted in five branches/predictions, with comprehension (receptive vocabulary) being the most informative predictor (followed by form). Other predictors (i.e., sex, language, age) were did not reduce error sufficiently to allow the creation of new branches. Now we will measure the RMSE for the training set.
+
+```{r, message=FALSE}
+# calculate RMSE for training
+rpart_pred_train <- data_train %>% mutate(pred_prod = predict(rpart_fit))
+
+## plot predicted vs observed vocab
+rpart_pred_train %>% 
+  ggplot(aes(x = production, y = pred_prod)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(color = color_blind_colors[5]) +
+  labs(title = "Predicted vs. observed productive vocabulary - Training", 
+       x = "Observed productive vocabulary", 
+       y = "Predicted productive vocabulary") +
+  theme_bw()
+
+# training RMSE
+rpart_train_rmse <- caret::RMSE(rpart_pred_train$production, rpart_pred_train$pred_prod)
+
+# create a RMSE table
+rmse_scores <- tibble(Model = "Regression Tree - Training", 
+                      RMSE = rpart_train_rmse)
+
+rmse_scores %>% knitr::kable()
+```
+
+The plot above shows that our five predicted branches roughly captures the observed scores in productive vocabulary in a staircase pattern. However, our predictions are off by `r rpart_train_rmse` words, on average. Now we will apply the same regression tree to our test set and measure its' accuracy. 
+
+```{r, message=FALSE}
+# rpart accuracy on test set
+rpart_test <- predict(rpart_fit, data_test)
+rpart_pred_test <- data_test %>% mutate(pred_prod = rpart_test)
+
+# RMSE accuracy
+## plot predicted vs observed vocab
+rpart_pred_test %>% 
+  ggplot(aes(x = production, y = pred_prod)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(color = color_blind_colors[5]) +
+  labs(title = "Predicted vs. observed productive vocabulary - Test", 
+       x = "Observed productive vocabulary", 
+       y = "Predicted productive vocabulary") +
+  theme_bw()
+
+# test RMSE
+rpart_test_rmse <- caret::RMSE(rpart_pred_test$production, rpart_pred_test$pred_prod)
+
+# add test RMSE to table
+rmse_scores <- bind_rows(rmse_scores, 
+                         tibble(Model = "Regression Tree - Test",
+                                RMSE = rpart_test_rmse))
+
+rmse_scores %>% knitr::kable()
+```
+
+Overall, we found similar "staircase" predictions on the test set. There was a slight increase in error, with our predictions being off by `r rpart_test_rmse` words (RMSE) in the test set--an increase of `r rpart_test_rmse - rpart_train_rmse` from the training predictions. Overall regression trees followed the same pattern across training and test sets. Now we will fit random forests to explore whether it provides better predictions.
+
+## Random Forest
+
+We now create a random forest: a set of regression trees and their average predictions. This might improve the accuracy of our predictions. We will also calculate the importance of each variable in this forest. 
+
+```{r, warning=FALSE, message=FALSE}
+# set seed for reproducibility
+if_else(getRversion() < 3.5, set.seed(345), set.seed(345, sample.kind = "Rounding"))
+
+# fit random forest on training set
+rf_fit <- randomForest::randomForest(production ~ ., data = data_train) 
+
+# measure variable importance
+varImp(rf_fit) %>% arrange(desc(Overall))
+
+# plot random forest
+plot(rf_fit) 
+```
+
+The plot above (error vs. trees) indicate that around 300 trees the error stabilizes. Similarly to regression trees, comprehension was the most important predictor. Now we will measure the accuracy we achieved on the training set.
+
+```{r, message=TRUE}
+# calculate RMSE for training
+rf_pred_train <- data_train %>% mutate(pred_prod = predict(rf_fit))
+
+## plot predicted vs observed vocab
+rf_pred_train %>% 
+  ggplot(aes(x = production, y = pred_prod)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(color = color_blind_colors[5]) +
+  labs(title = "Predicted vs. observed productive vocabulary - Training", 
+       x = "Observed productive vocabulary", 
+       y = "Predicted productive vocabulary") +
+  theme_bw()
+
+# training RMSE
+rf_train_rmse <- caret::RMSE(rf_pred_train$production, rf_pred_train$pred_prod)
+
+# create a RMSE table
+rmse_scores <- bind_rows(rmse_scores, 
+                         tibble(Model = "Random Forest - Training",
+                                RMSE = rf_train_rmse))
+
+rmse_scores %>% knitr::kable()
+```
+
+Despite the more complex approach (in comparison to Regression Trees), the training predictions were off by `r rf_train_rmse` words, on average. Now we will apply the same random forest model to our test set.
+
+```{r, message=FALSE}
+# rf accuracy on test set
+rf_test <- predict(rf_fit, data_test)
+rf_pred_test <- data_test %>% mutate(pred_prod = rf_test)
+
+# RMSE accuracy
+## plot predicted vs observed vocab
+rf_pred_test %>% 
+  ggplot(aes(x = production, y = pred_prod)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(color = color_blind_colors[5]) +
+  labs(title = "Predicted vs. observed productive vocabulary - Test", 
+       x = "Observed productive vocabulary", 
+       y = "Predicted productive vocabulary") +
+  theme_bw()
+
+# test RMSE
+rf_test_rmse <- caret::RMSE(rf_pred_test$production, rf_pred_test$pred_prod)
+
+# add test RMSE to table
+rmse_scores <- bind_rows(rmse_scores, 
+                         tibble(Model = "Random Forest - Test",
+                                RMSE = rf_test_rmse))
+
+rmse_scores %>% knitr::kable()
+```
+
+Despite the more complex approach, predicted scores for the test set were off by `r rf_test_rmse` words on average. Random forests were less accurate than regression trees when predicting production vocabulary for training (a deterioration of `r rf_train_rmse - rpart_train_rmse` words on average) and test sets (a deterioration of `r rf_test_rmse - rpart_test_rmse` words on average).
+
+## Linear Regression 
+
+Here we fit a linear regression model and check the estimated coefficients.
+
+```{r}
+# fit lm on training set
+lm_fit <- lm(production ~ ., data = data_train)
+
+# model summary 
+summary(lm_fit)
+```
+
+A brief look into the models' summary reveal that it captured relationships we explored visually (see previous section). For instance, productive vocabulary increases with age, comprehension, and form (WS). On the other hand, it decreases for male children. Now we check the accuracy of predictions for the training set. Furthermore, our model explains 95% of the variance in our data ($R^2$), suggesting a good fit. 
+
+```{r message=FALSE}
+# RMSE accuracy
+## add predicted scores to training set
+lm_pred_train <- data_train %>% mutate(pred_prod = predict(lm_fit))
+
+## plot predicted vs observed vocab
+lm_pred_train %>% 
+  ggplot(aes(x = production, y = pred_prod)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = lm, color = color_blind_colors[5]) +
+  labs(title = "Predicted vs. observed productive vocabulary - Training", 
+       x = "Observed productive vocabulary", 
+       y = "Predicted productive vocabulary") +
+  theme_bw()
+
+# training RMSE
+lm_train_rmse <- caret::RMSE(lm_pred_train$production, lm_pred_train$pred_prod)
+
+# add training RMSE to table
+rmse_scores <- bind_rows(rmse_scores, 
+                         tibble(Model = "Linear Regression - Training",
+                                RMSE = lm_train_rmse))
+
+rmse_scores %>% knitr::kable()
+```
+
+Our linear model predictions were positively correlated with observed scores of vocabulary. The largest differences between predicted and observed values occur in the lower scores (close to 0) and accuracy improves as vocabulary increases. Overall, the predicted scores are off by `r lm_train_rmse` words (RMSE) in the training set. Now we will fit the same linear regression to our test set and check its accuracy (RMSE). 
+
+```{r message=FALSE}
+# lm accuracy on test set
+lm_test <- predict(lm_fit, data_test)
+lm_pred_test <- data_test %>% mutate(pred_prod = lm_test)
+
+# RMSE accuracy
+## plot predicted vs observed vocab
+lm_pred_test %>% 
+  ggplot(aes(x = production, y = pred_prod)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = lm, color = color_blind_colors[5]) +
+  labs(title = "Predicted vs. observed productive vocabulary - Test", 
+       x = "Observed productive vocabulary", 
+       y = "Predicted productive vocabulary") +
+  theme_bw()
+
+# test RMSE
+lm_test_rmse <- caret::RMSE(lm_pred_test$production, lm_pred_test$pred_prod)
+
+# add test RMSE to table
+rmse_scores <- bind_rows(rmse_scores, 
+                         tibble(Model = "Linear Regression - Test",
+                                RMSE = lm_test_rmse))
+
+rmse_scores %>% knitr::kable()
+```
+
+Overall, we found very similar predictions on the test set. There was a slight increase in error, with our predictions being off by `r lm_test_rmse` words (RMSE) in the test set--an increase of `r lm_test_rmse - lm_train_rmse` from training predictions. The positive trend between predicted and observed scores is also present in the test set. This indicates that our linear regression model performed at similar levels in both sets, which indicates its' stability as a predictive machine learning strategy. 
+
+Furthermore, our linear regression model was more accurate than regression trees and random forests. For instance, looking at the test sets, it was, on average, `r rpart_test_rmse - lm_test_rmse` words more precise than regression trees and `r rf_test_rmse - lm_test_rmse` words more precise than random forests. We return to this point in the Conclusion.
+
+# Conclusion
+
+The present project explored potential relationships between age, gender, languages, comprehension, measurement instrument, and productive vocabulary. To do so, we used an open repository of vocabulary growth from the [WordBank project](http://wordbank.stanford.edu/) and three machine learning strategies (i.e., regression trees, random forests, and linear regression). 
+
+The arguably simplest model, linear regression, outperformed regression trees and random forests. On top of that, linear regression comes with the bonus of being easier to interpret and avoids the so called *black box* critic to machine learning. Overall, our linear regression model confirmed the trends we saw in the visualizations. For instance, productive vocabulary increases with age and comprehension across languages. Furthermore, it indicates that females have larger productive vocabularies than males. These trends are in line with previous reports in the language development literature (e.g., @frank2021, Kachergis2017a, Werker2013). 
+
+The increase of team-science projects such as the [WordBank](http://wordbank.stanford.edu/) (see also [ManyLabs](https://www.cos.io/blog/critique-many-labs-projects), [ManyBabies](https://manybabies.github.io/), [ManyPrimates](https://manyprimates.github.io/) etc.) have the potential to generate large and carefully collected datasets on complex topics such as language development. In line with recent recommendations (e.g., @Jacobucci2020, @Yarkoni2017), scientists can take advantage of analytic approaches based on machine learning algorithms to explore and gain insights on these increasingly rich and complex data.
+
+\pagebreak 
+
+# References
+
