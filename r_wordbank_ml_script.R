@@ -35,7 +35,7 @@ pkgs <- c("wordbankr", # v0.3.1
 
 # if necessary install
 installed_pkgs <- pkgs %in% rownames(installed.packages())
-if(any(installed_pkgs == F)){install.packages(pkgs[!installed_packages])}
+if(any(installed_pkgs == F)){install.packages(pkgs[!installed_pkgs])}
 
 # load packages
 invisible(lapply(pkgs, library, character.only = T))
